@@ -1,4 +1,5 @@
 from rdkit import Chem
+from rdkit.Chem import QED
 import numpy as np
 from qm9.bond_analyze import get_bond_order, geom_predictor
 from . import dataset
@@ -84,6 +85,61 @@ class BasicMolecularMetrics(object):
             self.dataset_smiles_list = retrieve_qm9_smiles(
                 self.dataset_info)
 
+    def check_validity(self, positions, atom_type):
+        """ positions: N x 3, atom_type: N [int]"""
+        mol = build_molecule(positions, atom_type, self.dataset_info)
+        #check molecule connectivity
+        if not check_molecule_connectivity(mol):
+            # return a value sampled from [-5, -3] uniformly to indicate invalid molecule
+            return np.random.uniform(-3.1, -3)
+        # check validity of mol using SanitizeMol
+        sanitize_result = Chem.SanitizeMol(mol, catchErrors=True)
+
+        # Success flag
+        # Chem.SanitizeFlags.SANITIZE_NONE  # No errors, sanitization successful
+
+        # # Individual error flags
+        # Chem.SanitizeFlags.SANITIZE_CLEANUP               # General cleanup issues
+        # Chem.SanitizeFlags.SANITIZE_PROPERTIES           # Property calculation issues
+        # Chem.SanitizeFlags.SANITIZE_SYMMRINGS            # Symmetry ring issues
+        # Chem.SanitizeFlags.SANITIZE_KEKULIZE             # Kekulization (aromatic bond assignment) failed
+        # Chem.SanitizeFlags.SANITIZE_FINDRADICALS         # Radical detection issues
+        # Chem.SanitizeFlags.SANITIZE_SETAROMATICITY       # Aromaticity assignment failed
+        # Chem.SanitizeFlags.SANITIZE_SETCONJUGATION       # Conjugation assignment failed
+        # Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION     # Hybridization assignment failed
+        # Chem.SanitizeFlags.SANITIZE_CLEANUPCHIRALITY     # Chirality cleanup issues
+        # Chem.SanitizeFlags.SANITIZE_ADJUSTHS             # Hydrogen adjustment issues
+        # Chem.SanitizeFlags.SANITIZE_SETVALENCE           # Valence checking failed (your case!)
+
+        if sanitize_result != Chem.SanitizeFlags.SANITIZE_NONE:
+            print("Molecule is valid. with error flag: ", sanitize_result)
+            return np.random.uniform(-1.1, -1)
+        return 1
+
+
+    def check_qed(self, positions, atom_type):
+        """ positions: N x 3, atom_type: N [int]"""
+        mol = build_molecule(positions, atom_type, self.dataset_info)
+        qed = QED.qed(mol)
+        return qed
+
+    def compute_qed(self, generated):
+        """ positions: N x 3, atom_type: N [int]"""
+        qed_list = []
+        for graph in generated:
+            positions = graph[0]
+            atom_type = graph[1]
+            mol = build_molecule(positions, atom_type, self.dataset_info)
+            qed = Chem.QED.qed(mol)
+            qed_list.append(qed)
+        return qed_list
+    
+    # def compute_logp(self, positions, atom_type):
+    #     """ positions: N x 3, atom_type: N [int]"""
+    #     mol = build_molecule(positions, atom_type, self.dataset_info)
+    #     logp = Chem.Crippen.MolLogP(mol)
+    #     return logp
+
     def compute_validity(self, generated):
         """ generated: list of couples (positions, atom_types)"""
         valid = []
@@ -152,6 +208,12 @@ def build_molecule(positions, atom_types, dataset_info):
     all_bonds = torch.nonzero(A)
     for bond in all_bonds:
         mol.AddBond(bond[0].item(), bond[1].item(), bond_dict[E[bond[0], bond[1]].item()])
+    # try:
+    #     Chem.SanitizeMol(mol)
+    # except Exception as e:
+    #     print("Sanitization failed:", e)
+    #     for atom in mol.GetAtoms():
+    #         print(f"Atom {atom.GetIdx()} ({atom.GetSymbol()}), degree: {atom.GetDegree()}, valence: {atom.GetExplicitValence()}")    
     return mol
 
 
@@ -186,6 +248,23 @@ def build_xae_molecule(positions, atom_types, dataset_info):
                 A[i, j] = 1
                 E[i, j] = order
     return X, A, E
+
+def check_molecule_connectivity(mol):
+    """
+    Check molecule connectivity before sanitization.
+    """
+    # Check for isolated hydrogen atoms specifically
+    for atom in mol.GetAtoms():
+        if atom.GetSymbol() == 'H' and atom.GetDegree() == 0:
+            print("Found isolated hydrogen atom")
+            return False
+            
+        # Check for any isolated atoms
+        if atom.GetDegree() == 0:
+            print(f"Found isolated {atom.GetSymbol()} atom")
+            return False
+    
+    return True
 
 if __name__ == '__main__':
     smiles_mol = 'C1CCC1'

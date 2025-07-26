@@ -7,7 +7,9 @@ kohler/cache/*
 *.ipynb
 .
 *.log
-*wandb*
+# ignore all files under wandb folder
+wandb/*
+# *wandb*
 *.DS_Store*
 qm9/temp/*
 kohler/qm9/temp/*
@@ -30,3 +32,4 @@ qm9/property_prediction/outputs/*
 qm9_conditional.sh
 figures/
 geom_drugs.sh
+slurm_files/*

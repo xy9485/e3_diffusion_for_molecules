@@ -6,6 +6,11 @@ from egnn import models
 from torch.nn import functional as F
 from equivariant_diffusion import utils as diffusion_utils
 
+from typing import Optional, Tuple, Union
+
+from qm9.analyze import check_stability
+from utils import gradient_clipping
+from qm9.rdkit_functions import BasicMolecularMetrics
 
 # Defining some useful util functions.
 def expm1(x: torch.Tensor) -> torch.Tensor:
@@ -19,6 +24,8 @@ def softplus(x: torch.Tensor) -> torch.Tensor:
 def sum_except_batch(x):
     return x.view(x.size(0), -1).sum(-1)
 
+def mean_except_batch(x):
+    return x.view(x.size(0), -1).mean(-1)
 
 def clip_noise_schedule(alphas2, clip_value=0.001):
     """
@@ -246,6 +253,27 @@ class GammaNetwork(torch.nn.Module):
 
 
 def cdf_standard_gaussian(x):
+    r"""
+    The **cumulative distribution function (CDF)** of the **standard Gaussian (normal) distribution**, denoted as Φ(x), gives the probability that a normally distributed random variable with mean 0 and standard deviation 1 is less than or equal to $x$:
+
+    $$
+    \Phi(x) = \frac{1}{\sqrt{2\pi}} \int_{-\infty}^{x} e^{-t^2 / 2} \, dt
+    $$
+
+    Since this integral has no closed-form solution in terms of elementary functions, it's typically evaluated numerically or expressed using the **error function (erf)**:
+
+    $$
+    \Phi(x) = \frac{1}{2} \left[1 + \text{erf}\left( \frac{x}{\sqrt{2}} \right)\right]
+    $$
+
+    Where the **error function** is defined as:
+
+    $$
+    \text{erf}(z) = \frac{2}{\sqrt{\pi}} \int_0^z e^{-t^2} \, dt
+    $$
+
+    Would you like a table, plot, or code to compute it?
+    """
     return 0.5 * (1. + torch.erf(x / math.sqrt(2)))
 
 
@@ -457,7 +485,13 @@ class EnVariationalDiffusion(torch.nn.Module):
         return error
 
     def log_constants_p_x_given_z0(self, x, node_mask):
-        """Computes p(x|z0)."""
+        """
+        Computes p(x|z0).
+        
+        For a d-dimensional Gaussian with standard deviation σ, the normalizing constant is (2πσ²)^(-d/2)
+        Taking the log gives: -d/2 * log(2π) - d * log(σ)
+        This function computes: degrees_of_freedom * (-log_sigma_x - 0.5 * log(2π))
+        """
         batch_size = x.size(0)
 
         n_nodes = node_mask.squeeze(2).sum(1)  # N has shape [B]
@@ -476,7 +510,14 @@ class EnVariationalDiffusion(torch.nn.Module):
         """Samples x ~ p(x|z0)."""
         zeros = torch.zeros(size=(z0.size(0), 1), device=z0.device)
         gamma_0 = self.gamma(zeros)
-        # Computes sqrt(sigma_0^2 / alpha_0^2)
+        """
+        Computes sqrt(sigma_0^2 / alpha_0^2) 
+        Notably here we are talking about sigma_0^2 / alpha_0^2, not alpha_0^2 / sigma_0^2, which is self.SNR(gamma_0).
+        Since z0 = alpha_0 * x + sigma_0 * epsilon
+        x = 1 / alpha_0 * (z0 - sigma_0 * epsilon) = z0/ alpha_0 - sigma_0 / alpha_0 * epsilon
+        Since -epsilon ~ N(0, 1), we can sample from the Normal distribution: p(x | z0) = N(1 / alpha_0 * z0, sigma_0 / alpha_0)
+        """
+
         sigma_x = self.SNR(-0.5 * gamma_0).unsqueeze(1)
         net_out = self.phi(z0, zeros, node_mask, edge_mask, context)
 
@@ -536,6 +577,7 @@ class EnVariationalDiffusion(torch.nn.Module):
             - cdf_standard_gaussian((h_integer_centered - 0.5) / sigma_0_int)
             + epsilon)
         log_ph_integer = sum_except_batch(log_ph_integer * node_mask)
+        # The above measures the probability mass of a normal distribution with mean=error and stdev=noise_level that falls within the boundaries [-0.5, 0.5], essentially the probability that a noisy prediction would round to the correct integer.
 
         # Centered h_cat around 1, since onehot encoded.
         centered_h_cat = estimated_h_cat - 1
@@ -744,6 +786,52 @@ class EnVariationalDiffusion(torch.nn.Module):
         )
         return zs
 
+    def sample_p_zs_given_zt_rl(self, s, t, zt, node_mask, edge_mask, context, fix_noise=False, action: Optional[torch.FloatTensor]=None):
+        """Samples from zs ~ p(zs | zt). Only used during sampling."""
+        gamma_s = self.gamma(s)
+        gamma_t = self.gamma(t)
+
+        sigma2_t_given_s, sigma_t_given_s, alpha_t_given_s = \
+            self.sigma_and_alpha_t_given_s(gamma_t, gamma_s, zt)
+
+        sigma_s = self.sigma(gamma_s, target_tensor=zt)
+        sigma_t = self.sigma(gamma_t, target_tensor=zt)
+
+        # Neural net prediction.
+        eps_t = self.phi(zt, t, node_mask, edge_mask, context)
+
+        # Compute mu for p(zs | zt).
+        diffusion_utils.assert_mean_zero_with_mask(zt[:, :, :self.n_dims], node_mask)
+        diffusion_utils.assert_mean_zero_with_mask(eps_t[:, :, :self.n_dims], node_mask)
+        mu = zt / alpha_t_given_s - (sigma2_t_given_s / alpha_t_given_s / sigma_t) * eps_t
+
+        # Compute sigma for p(zs | zt).
+        sigma = sigma_t_given_s * sigma_s / sigma_t
+
+        zs_xzeromean = None
+        if action is None:
+            # Sample zs given the paramters derived from zt.
+            action = self.sample_normal(mu, sigma, node_mask, fix_noise)
+
+            # Project down to avoid numerical runaway of the center of gravity.
+            zs_xzeromean = torch.cat(
+                [diffusion_utils.remove_mean_with_mask(action[:, :, :self.n_dims],
+                                                    node_mask),
+                action[:, :, self.n_dims:]], dim=2
+            )
+        # log prob of action given mu and sigma, action is zs before applying remove_mean_with_mask
+        log_prob = (
+        -((action.detach() - mu) ** 2) / (2 * (sigma**2))
+        - torch.log(sigma)
+        - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+        )
+        log_prob = sum_except_batch(log_prob * node_mask)
+        # log_prob = mean_except_batch(log_prob * node_mask)
+        n_atoms = torch.sum(node_mask.squeeze(), dim=1)
+        log_prob = log_prob / n_atoms
+
+        return { "action": action, "mu": mu, "sigma": sigma, "eps_t": eps_t, "log_prob": log_prob, "zs_xzeromean": zs_xzeromean}
+
     def sample_combined_position_feature_noise(self, n_samples, n_nodes, node_mask):
         """
         Samples mean-centered normal noise for z_x, and standard normal noise for z_h.
@@ -772,6 +860,8 @@ class EnVariationalDiffusion(torch.nn.Module):
 
         # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
         for s in reversed(range(0, self.T)):
+        # for s in reversed(range(0, 1)):
+            print(f"Diffusion step {s} / {5}")
             s_array = torch.full((n_samples, 1), fill_value=s, device=z.device)
             t_array = s_array + 1
             s_array = s_array / self.T
@@ -793,7 +883,7 @@ class EnVariationalDiffusion(torch.nn.Module):
         return x, h
 
     @torch.no_grad()
-    def sample_chain(self, n_samples, n_nodes, node_mask, edge_mask, context, keep_frames=None):
+    def sample_chain(self, n_samples, n_nodes, node_mask, edge_mask, context, keep_frames=None, dataset_info=None):
         """
         Draw samples from the generative model, keep the intermediate states for visualization purposes.
         """
@@ -833,6 +923,31 @@ class EnVariationalDiffusion(torch.nn.Module):
 
         chain_flat = chain.view(n_samples * keep_frames, *z.size()[1:])
 
+        metrics = BasicMolecularMetrics(dataset_info)
+        rewards = torch.zeros(n_samples, device=z.device)
+        # rdkit_metrics = metrics.evaluate(processed_list)
+        for i in range(len(xh)):
+            x = xh[i, :, 0:3]
+            h = xh[i, :, 3:-1]
+
+            # x = x.cpu().detach().numpy()
+            # atom_type = torch.argmax(one_hot, dim=1).cpu().detach().numpy()
+            
+            atom_type = torch.argmax(h, dim=1)
+
+            # molecule_stable, nr_stable_bonds, len_X = check_stability(x, atom_type, dataset_info)
+            # rewards[i] = nr_stable_bonds / len_X
+
+            # rewards[i] = metrics.check_qed(x, atom_type)
+            validity = metrics.check_validity(x, atom_type)
+            total_reward = validity
+            if validity == 1:  # if the molecule is valid
+                qed = metrics.check_qed(x, atom_type)
+                # consider different magnitudes of qed and validity(1 or -1)
+                total_reward += qed
+            rewards[i] = total_reward
+
+        print(f"rewards: {rewards}")
         return chain_flat
 
     def log_info(self):
@@ -851,3 +966,250 @@ class EnVariationalDiffusion(torch.nn.Module):
         print(info)
 
         return info
+
+
+    def sample_chain_rl(self, node_mask=None, edge_mask=None, context=None, ppo_config=None, device=None, optimizer=None, gradnorm_queue=None, dataset_info=None, nodesxsample=None):
+        """
+        Draw samples from the generative model, keep the intermediate states for visualization purposes.
+        """
+
+        max_n_nodes = dataset_info['max_n_nodes'] 
+        assert int(torch.max(nodesxsample)) <= max_n_nodes
+
+        # n_samples = ppo_config.n_samples
+        n_samples = node_mask.size(0) 
+        # n_nodes = node_mask[0].sum().long().item() # Number of nodes in each sample.
+        # n_samples = len(nodesxsample)
+
+        # node_mask = torch.zeros(n_samples, max_n_nodes)
+        # for i in range(n_samples):
+        #     node_mask[i, 0:nodesxsample[i]] = 1
+
+
+        # edge_mask = node_mask.unsqueeze(1) * node_mask.unsqueeze(2)
+        # diag_mask = ~torch.eye(edge_mask.size(1), dtype=torch.bool).unsqueeze(0)
+        # edge_mask *= diag_mask
+        # edge_mask = edge_mask.view(n_samples * max_n_nodes * max_n_nodes, 1).to(device)
+        # node_mask = node_mask.unsqueeze(2).to(device)
+
+
+        # Initialize z with Gaussian noise as the initial state for RL.
+        z = self.sample_combined_position_feature_noise(n_samples, max_n_nodes, node_mask)
+        next_done = torch.zeros(n_samples, device=z.device)
+
+
+        diffusion_utils.assert_mean_zero_with_mask(z[:, :, :self.n_dims], node_mask)
+
+        episode_length = self.T // ppo_config.inference_interval
+        obs = torch.zeros((episode_length,) + z.size(), device=z.device) # obs
+        actions = torch.zeros((episode_length,) + z.size(), device=z.device)
+        log_probs = torch.zeros((episode_length, n_samples), device=z.device)
+        rewards = torch.zeros(n_samples, device=z.device)
+        timesteps_t = torch.zeros((episode_length, n_samples, 1), device=z.device)
+        timesteps_s = torch.zeros((episode_length, n_samples, 1), device=z.device)
+        # rewards = torch.zeros((self.T,) + (n_samples, 1), device=z.device)
+        dones = torch.zeros((episode_length, n_samples), device=z.device)
+        values = torch.zeros((episode_length, n_samples), device=z.device)
+
+        z_min = torch.zeros((episode_length, n_samples, z.size()[2]), device=z.device)
+        z_max = torch.zeros((episode_length, n_samples, z.size()[2]), device=z.device)
+
+
+        # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
+
+        for idx, s in enumerate(reversed(range(0, self.T, ppo_config.inference_interval))):
+            s_array = torch.full((n_samples, 1), fill_value=s, device=z.device)
+            t_array = s_array + ppo_config.inference_interval
+            timesteps_t[idx] = t_array
+            timesteps_s[idx] = s_array
+
+            s_array = s_array / self.T
+            t_array = t_array / self.T
+
+            # idx = self.T - s - 1 
+            # obs[idx] = self.unnormalize_z(z, node_mask)
+            obs[idx] = z
+            dones[idx] = next_done
+
+            z_min[idx, :, :self.n_dims] = z[:, :, :self.n_dims].min(dim=1).values
+            z_min[idx, :, self.n_dims:-1] = z[:, :, self.n_dims:-1].min(dim=1).values
+            z_min[idx, :, -1] = z[:, :, -1].min(dim=1).values
+            z_max[idx, :, :self.n_dims] = z[:, :, :self.n_dims].max(dim=1).values
+            z_max[idx, :, self.n_dims:-1] = z[:, :, self.n_dims:-1].max(dim=1).values
+            z_max[idx, :, -1] = z[:, :, -1].max(dim=1).values
+
+            with torch.no_grad():
+                # value = self.sample_policy.critic(z)
+                info = self.sample_p_zs_given_zt_rl(
+                    s_array, t_array, z, node_mask, edge_mask, context)
+                # values[idx] = value   
+            if info['zs_xzeromean'] is not None:
+                z = info['zs_xzeromean'] 
+            else:
+                raise ValueError("zs_xzeromean is None, check the implementation of sample_p_zs_given_zt_rl")
+
+            actions[idx] = info['action']
+            log_probs[idx] = info['log_prob']
+
+            # rewards[idx] = self.compute_reward(z, node_mask, edge_mask, context)
+
+            # if s == 0:
+            #     next_done = torch.ones(n_samples, device=z.device)
+            # else:
+            #     next_done = torch.zeros(n_samples, device=z.device)
+
+            diffusion_utils.assert_mean_zero_with_mask(z[:, :, :self.n_dims], node_mask)
+            pass
+
+        # Finally sample p(x, h | z_0).
+        x, h = self.sample_p_xh_given_z0(z, node_mask, edge_mask, context)
+        diffusion_utils.assert_mean_zero_with_mask(x[:, :, :self.n_dims], node_mask)
+
+        # xh = torch.cat([x, h['categorical'], h['integer']], dim=2)
+
+        # Compute rewards and advantages
+        rewards = self.rewards_given_xh(x, h['categorical'], node_mask, dataset_info)
+        rewards = torch.tensor(rewards, device=device)
+
+        advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
+        episodic_metrics = {
+            'rewards': rewards.mean().item(),
+            'advantages': advantages.mean().item(),
+        }
+        # print(f"stability: molecule_stable: {molecule_stable}, nr_stable_bonds: {nr_stable_bonds}, len_X: {len_X}")
+        print(f"Rewards: {rewards}")
+        print(f"Advantages: {advantages}")
+        # print(f"Rewards: {rewards}, mean: {rewards.mean().item()}, std: {rewards.std().item()}")
+        # print(f"Advantages: {advantages}")
+
+
+        # flatten the batch
+        # obs = obs.view(n_samples * self.T, *z.size()[1:])
+        # log_probs = log_probs.view(n_samples * self.T, 1)
+        # actions = actions.view(n_samples * self.T, *z.size()[1:])
+
+        # b_inds = np.arange(n_samples * self.T)
+        b_inds = np.arange(len(obs))
+
+        # with torch.no_grad():
+        #     next_value = self.sample_policy.critic(z)
+        batch_size = ppo_config.batch_size
+        node_mask_train = node_mask.repeat(batch_size, 1, 1)
+        edge_mask_train = edge_mask.reshape(n_samples, -1).unsqueeze(0).repeat(batch_size, 1, 1).reshape(-1, 1)
+        advantages_batch = advantages.repeat(batch_size, 1).view(-1)
+
+        for epoch in range (2):
+            np.random.shuffle(b_inds)
+            for start in range(0, len(b_inds), batch_size):
+                end = start + batch_size
+                indices = b_inds[start:end]
+
+                # Get the batch
+                batch_obs = obs[indices].view(batch_size * n_samples, *z.size()[1:])
+                batch_log_probs = log_probs[indices].view(-1)
+                batch_actions = actions[indices].view(batch_size * n_samples, *z.size()[1:])
+
+                t = timesteps_t[indices].view(-1, 1) # Get the s values from the timesteps
+                s = timesteps_s[indices].view(-1, 1)
+                
+                # s = indices.repeat(2,1)
+                # t = s + 1
+                s = s / self.T
+                t = t / self.T
+
+                # s_array = torch.full((n_samples, 1), fill_value=s, device=z.device)
+                # t_array = s_array + 1
+                # s_array = s_array / self.T
+                # t_array = t_array / self.T
+
+                info = self.sample_p_zs_given_zt_rl(s, t, batch_obs, node_mask_train, edge_mask_train, context, action=batch_actions)
+
+                # ppo logic 
+
+                # advantages = torch.clamp(
+                #             advantages,
+                #             -config.train.adv_clip_max,
+                #             config.train.adv_clip_max,
+                #         )
+                log_prob = info['log_prob']
+                logratio = log_prob - batch_log_probs
+                ratio = logratio.exp()
+
+                # advantages = torch.clamp(
+                #     advantages_batch,
+                #     -5,
+                #     5,
+                # )
+
+                unclipped_loss = -advantages_batch * ratio
+                clipped_loss = -advantages_batch * torch.clamp(
+                    ratio,
+                    1.0 - ppo_config.clip_range,
+                    1.0 + ppo_config.clip_range,
+                )
+                loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+
+                # Update the policy
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.dynamics.parameters(), max_norm=1.0)
+                # for name, param in self.dynamics.named_parameters():
+                #     if param.grad is not None:
+                #         # print(f"Gradient norm for {name}: {param.grad}")
+                #         # print(f"Gradient norm for {name}")
+                #         # break
+                #         # clip gradient
+                #         param.grad.data = torch.clamp(param.grad.data, -1, 1)
+                # gradient_clipping(self, gradnorm_queue)
+                optimizer.step()
+
+
+        return episodic_metrics
+
+    def rewards_given_xh(self, coord, one_hot, node_mask, dataset_info):
+        # Compute rewards and advantages
+
+        assert isinstance(node_mask, torch.Tensor)
+        atomsxmol = torch.sum(node_mask, dim=1)
+
+        processed_list = []
+        for i in range(coord.size(0)):
+            atom_type = torch.argmax(one_hot[i], dim=1).cpu().detach()
+            pos = coord[i].cpu().detach()
+            atom_type = atom_type[0:int(atomsxmol[i])]
+            pos = pos[0:int(atomsxmol[i])]
+            processed_list.append((pos, atom_type))
+
+        metrics = BasicMolecularMetrics(dataset_info)
+        # rdkit_metrics = metrics.evaluate(processed_list)
+        rewards = []
+        for mol in processed_list:
+            x, atom_type = mol
+
+            # x = x.cpu().detach().numpy()
+            # atom_type = torch.argmax(one_hot, dim=1).cpu().detach().numpy()
+            
+            # atom_type = torch.argmax(h, dim=1)
+
+            # molecule_stable, nr_stable_bonds, len_X = check_stability(x, atom_type, dataset_info)
+            # rewards[i] = nr_stable_bonds / len_X
+
+            # rewards[i] = metrics.check_qed(x, atom_type)
+            validity = metrics.check_validity(x, atom_type)
+            total_reward = validity
+            if validity == 1:  # if the molecule is valid
+                qed = metrics.check_qed(x, atom_type)
+                # consider different magnitudes of qed and validity(1 or -1)
+                total_reward += qed
+            rewards.append(total_reward)
+        return rewards
+
+class Agent(torch.nn.Module):
+    """
+    The RL agent that will be trained to finetune the generation of the diffusion model.
+    """
+    def __init__(self, DiffModel: EnVariationalDiffusion, n_dims: int):
+        super().__init__()
+        self.actor = DiffModel.dynamics
+        self.n_dims = n_dims

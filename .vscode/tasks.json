@@ -1,0 +1,111 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "srun interactive + wait for debug",
+        "type": "shell",
+        "command": "srun --gpus=1 --mem=12G -t 2:00:00 --pty bash -i -c '${workspaceFolder}/run_main_qm9.sh'",
+        // "command": "srun -p ampere --gpus=1 --mem=12G -t 2:00:00 --pty bash -i -c '/home/xue/repos/EDM/e3_diffusion_for_molecules/run_main_qm9.sh'",
+        // "command": "srun -t 2:00:00 --pty bash -i -c '/home/xue/repos/EDM/e3_diffusion_for_molecules/run_main_qm9.sh'",
+        "problemMatcher": [],
+        "isBackground": false,
+        "presentation": {
+          "reveal": "always",
+          "panel": "new",
+          "focus": true
+        }
+      },
+      {
+        "label": "Start Debug",
+        "type": "shell",
+        "command": "code --exec 'extension.debug.startDebugging' --args 'Python Debugger: Remote Attach'",
+        "problemMatcher": [],
+        "isBackground": false,
+        "presentation": {
+          "reveal": "always",
+          "panel": "new",
+          "focus": true
+        }
+      },
+      {
+        "label": "Launch Debug: Remote Attach",
+        "type": "process",
+        "command": "${command:workbench.action.debug.start}",
+        "args": [
+          "Python Debugger: Remote Attach"
+        ],
+        "problemMatcher": [],
+        "isBackground": false,
+        "options": {},
+        "presentation": {
+          "reveal": "always",
+          "panel": "new"
+        }
+      },
+      {
+        "label": "DebugOnNode",
+        "dependsOrder": "sequence",
+        "dependsOn": [
+          "srun interactive + udpate hostname for launch.json",
+          "Launch Debug: Remote Attach"
+        ]
+      },
+      {
+        "label": "refresh-input",
+        "type": "shell",
+        "command": "echo Refreshing input...",
+        "problemMatcher": [],
+        "runOptions": {
+          "reevaluateOnRerun": true
+        },
+        "presentation": {
+          "panel": "new",
+          "focus": true
+        }
+      },
+      {
+        "label": "srun interactive and python run",
+        "type": "shell",
+        "command": "srun --gpus=1 -t 3:00:00 --pty bash -c './home/xue/repos/EDM/run_main_qm9.sh'",
+        "problemMatcher": [],
+        "isBackground": false,
+        "presentation": {
+          "reveal": "always",
+          "panel": "new",
+          "focus": true
+        },
+        "options": {
+          "env": {
+            "DEBUG_HOST": "${input:host}"
+          }
+        }
+      },
+      {
+        "label": "python run by shell script",
+        "type": "shell",
+        "command": "./home/xue/repos/EDM/run_main_qm9.sh",
+        "problemMatcher": [],
+        "isBackground": false,
+        "presentation": {
+          "reveal": "always",
+          "panel": "new",
+          "focus": true
+        }
+      },
+      {
+        "label": "AutoDebug",
+        "dependsOrder": "sequence",
+        "dependsOn": [
+          "srun interactive and python run",
+          "Start Debug"
+        ]
+      }
+    ],
+    "inputs": [
+        {
+          "id": "host",
+          "type": "command",
+          "command": "hostname"
+        }
+      ]
+}

@@ -27,6 +27,13 @@ except ModuleNotFoundError:
     print('Not importing rdkit functions.')
 
 
+import debugpy
+
+# Use any open port, e.g., 5678
+debugpy.listen(("0.0.0.0", 5678))
+print("🔍 Waiting for debugger attach on port 5678...")
+debugpy.wait_for_client()
+
 def check_mask_correct(variables, node_mask):
     for variable in variables:
         assert_correctly_masked(variable, node_mask)

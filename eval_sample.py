@@ -1,3 +1,10 @@
+import debugpy
+
+# Use any open port, e.g., 5678
+debugpy.listen(("0.0.0.0", 5678))
+print("🔍 Waiting for debugger attach on port 5678...")
+debugpy.wait_for_client()
+
 # Rdkit import should be first, do not move it
 try:
     from rdkit import Chem
@@ -16,9 +23,12 @@ import pickle
 import qm9.visualizer as vis
 from qm9.analyze import check_stability
 from os.path import join
-from qm9.sampling import sample_chain, sample
+from qm9.sampling import sample_chain, sample, finetune_ppo
 from configs.datasets_config import get_dataset_info
 
+
+import wandb
+from wandb_logger import LoggerWandb
 
 def check_mask_correct(variables, node_mask):
     for variable in variables:
@@ -35,13 +45,13 @@ def save_and_sample_chain(args, eval_args, device, flow,
         one_hot, charges, x = sample_chain(
             args, device, flow, n_tries, dataset_info)
 
-        vis.save_xyz_file(
-            join(eval_args.model_path, target_path), one_hot, charges, x,
-            dataset_info, id_from, name='chain')
+        # vis.save_xyz_file(
+        #     join(eval_args.model_path, target_path), one_hot, charges, x,
+        #     dataset_info, id_from, name='chain')
 
-        vis.visualize_chain_uncertainty(
-            join(eval_args.model_path, target_path), dataset_info,
-            spheres_3d=True)
+        # vis.visualize_chain_uncertainty(
+        #     join(eval_args.model_path, target_path), dataset_info,
+        #     spheres_3d=True)
 
     return one_hot, charges, x
 
@@ -68,6 +78,9 @@ def sample_only_stable_different_sizes_and_save(
     one_hot, charges, x, node_mask = sample(
         args, device, flow, dataset_info,
         nodesxsample=nodesxsample)
+    
+    rewards = flow.rewards_given_xh(x, one_hot, dataset_info)
+    print(f"Rewards: {rewards}")
 
     counter = 0
     for i in range(n_tries):
@@ -140,25 +153,46 @@ def main():
     flow.load_state_dict(flow_state_dict)
 
     print('Sampling handful of molecules.')
-    sample_different_sizes_and_save(
-        args, eval_args, device, flow, nodes_dist,
-        dataset_info=dataset_info, n_samples=30)
+    # for i in range(20):
+    #     print(f'Sampled molecule iteration {i}:')
+    #     sample_different_sizes_and_save(
+    #         args, eval_args, device, flow, nodes_dist,
+    #         dataset_info=dataset_info, n_samples=30)
+
 
     print('Sampling stable molecules.')
-    sample_only_stable_different_sizes_and_save(
-        args, eval_args, device, flow, nodes_dist,
-        dataset_info=dataset_info, n_samples=10, n_tries=2*10)
+    # sample_only_stable_different_sizes_and_save(
+    #     args, eval_args, device, flow, nodes_dist,
+    #     dataset_info=dataset_info, n_samples=10, n_tries=2*10)
     print('Visualizing molecules.')
-    vis.visualize(
-        join(eval_args.model_path, 'eval/molecules/'), dataset_info,
-        max_num=100, spheres_3d=True)
+    # vis.visualize(
+    #     join(eval_args.model_path, 'eval/molecules/'), dataset_info,
+    #     max_num=100, spheres_3d=True)
 
     print('Sampling visualization chain.')
-    save_and_sample_chain(
-        args, eval_args, device, flow,
-        n_tries=eval_args.n_tries, n_nodes=eval_args.n_nodes,
-        dataset_info=dataset_info)
+    # save_and_sample_chain(
+    #     args, eval_args, device, flow,
+    #     n_tries=eval_args.n_tries, n_nodes=eval_args.n_nodes,
+    #     dataset_info=dataset_info)
+    
 
+    # init wandb
+    run = wandb.init(
+        project="EDM-PPO",
+        mode="online",
+        group="EDM-PPO-1",
+    )
+    wandb_logger = LoggerWandb()
+    for i in range(10):
+        print("ppo update round", i)
+        finetune_ppo(
+            args,
+            device, 
+            flow, 
+            nodes_dist,
+            dataset_info=dataset_info, 
+            wandb_logger=wandb_logger
+            )
 
 if __name__ == "__main__":
     main()

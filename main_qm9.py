@@ -1,3 +1,10 @@
+import debugpy
+
+# Use any open port, e.g., 5678
+debugpy.listen(("0.0.0.0", 5678))
+print("🔍 Waiting for debugger attach on port 5678...")
+debugpy.wait_for_client()
+
 # Rdkit import should be first, do not move it
 try:
     from rdkit import Chem
@@ -274,6 +281,7 @@ def main():
                 if args.save_model:
                     utils.save_model(optim, 'outputs/%s/optim_%d.npy' % (args.exp_name, epoch))
                     utils.save_model(model, 'outputs/%s/generative_model_%d.npy' % (args.exp_name, epoch))
+                    print (f'Saving model to outputs/{args.exp_name}/generative_model_{epoch}.npy')
                     if args.ema_decay > 0:
                         utils.save_model(model_ema, 'outputs/%s/generative_model_ema_%d.npy' % (args.exp_name, epoch))
                     with open('outputs/%s/args_%d.pickle' % (args.exp_name, epoch), 'wb') as f:
